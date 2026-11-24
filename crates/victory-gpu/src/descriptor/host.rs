@@ -525,6 +525,19 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    // A view past its host copy's end is an invalid call (the debug layer
+    // removes the device; drivers may fault): none past the end, the rest
+    // cut to fit.
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    if buffer.FirstElement >= capacity {
+        let first = buffer.FirstElement;
+        once!(first, capacity, "buffer view past the end of its host copy");
+        return None;
+    }
+    if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
+        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -567,6 +580,19 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement += offset / element;
+    // A view past its host copy's end is an invalid call (the debug layer
+    // removes the device; drivers may fault): none past the end, the rest
+    // cut to fit.
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    if buffer.FirstElement >= capacity {
+        let first = buffer.FirstElement;
+        once!(first, capacity, "buffer view past the end of its host copy");
+        return None;
+    }
+    if buffer.FirstElement + u64::from(buffer.NumElements) > capacity {
+        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
+    }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
