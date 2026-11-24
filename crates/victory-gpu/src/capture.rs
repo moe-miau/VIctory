@@ -191,7 +191,8 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        // The readback starts at offset zero. Its last row can end before a full pitch.
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -280,7 +281,7 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
