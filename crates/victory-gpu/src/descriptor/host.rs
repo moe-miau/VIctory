@@ -300,9 +300,18 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
+        let previous = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(slot) = kept.get_mut(index as usize) else {
+                return;
+            };
+            std::mem::replace(slot, resource)
+        };
+        // A list recording after this one may read the slot through an
+        // argument buffer a shader wrote, so nothing here can tell that the
+        // resource is done: release it behind the queue.
+        if let Some(previous) = previous {
+            crate::host::release_late(previous);
         }
     }
 
