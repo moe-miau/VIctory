@@ -133,7 +133,15 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
-            private_data().retain(|&(object, _), _| object != this as usize);
+            {
+                // The map groups this object's entries by address.
+                let address = this as usize;
+                let keys = (address, [0; 16])..=(address, [u8::MAX; 16]);
+                let mut data = private_data();
+                while let Some((&key, _)) = data.range(keys.clone()).next() {
+                    data.remove(&key);
+                }
+            }
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
@@ -393,6 +401,44 @@ mod tests {
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+    }
+
+    #[test]
+    fn last_release_clears_only_the_released_objects_private_data() {
+        let null = std::ptr::null();
+        let mut objects = [null; 3];
+        for object in &mut objects {
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], object),
+                S_OK
+            );
+        }
+        objects.sort_unstable_by_key(|&object| object as usize);
+        let [lower, middle, upper] = objects;
+        let keys = [[0; 16], DEBUG_OBJECT_NAME_W, [u8::MAX; 16]];
+        let value = [42u8];
+        for object in objects {
+            for key in keys {
+                assert_eq!(set_private_data(object, &key, 1, value.as_ptr()), S_OK);
+            }
+        }
+
+        let release = slot::<extern "system" fn(This) -> u32>(middle, 0x10);
+        let address = middle as usize;
+        assert_eq!(add_ref(middle), 2);
+        assert_eq!(release(middle), 1);
+        assert!(keys.iter().all(|&key| private_data().contains_key(&(address, key))));
+        assert_eq!(release(middle), 0);
+        {
+            let data = private_data();
+            for key in keys {
+                assert!(!data.contains_key(&(address, key)));
+                assert_eq!(data[&(lower as usize, key)], value);
+                assert_eq!(data[&(upper as usize, key)], value);
+            }
+        }
+        assert_eq!(release(lower), 0);
+        assert_eq!(release(upper), 0);
     }
 
     #[test]
