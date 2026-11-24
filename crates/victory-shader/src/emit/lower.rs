@@ -973,6 +973,7 @@ impl<'a> Lower<'a> {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
+                    Some(Input::GroupInfo) => self.group_info(v),
                     Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
@@ -995,6 +996,37 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
+    }
+
+    /// The thread-group info SGPR (`COMPUTE_PGM_RSRC2.TG_SIZE_EN`): bits 5:0
+    /// hold the waves in the group, bit 31 marks the first wave and bits
+    /// 16:6 an ordered-append term (LLVM AMDGPUUsage, "Initial Kernel
+    /// Execution State"). Only the wave count is derived, so the value is
+    /// given only to programs that read nothing but bits 5:0 of it.
+    fn group_info(&mut self, v: Value) -> Val {
+        let low = |o: &Operand| match *o {
+            Operand::Literal(k) => Some(k),
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            _ => None,
+        };
+        let only_count = self.x.p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+            if !i.reads.iter().any(|r| r.1 == v) {
+                return true;
+            }
+            let Fields::Sop { src, .. } = &i.fields else {
+                return false;
+            };
+            match (i.name(), src.get(1).and_then(low)) {
+                ("s_and_b32", Some(mask)) => mask & !0x3F == 0,
+                ("s_bfe_u32", Some(k)) => (k & 31) + (k >> 16 & 0x7F) <= 6,
+                _ => false,
+            }
+        });
+        let Some([x, y, z]) = self.s.threads.filter(|_| only_count) else {
+            return Val::Missing("the thread-group info SGPR above the wave count");
+        };
+        let waves = (x * y * z).div_ceil(self.wave());
+        Val::I32(self.s.m.i32(waves))
     }
 
     fn input(&mut self, input: Input) -> Val {
