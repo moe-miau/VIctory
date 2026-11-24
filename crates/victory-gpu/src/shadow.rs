@@ -398,7 +398,21 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let Some(Entry {
+        shadow: Some(shadow), ..
+    }) = buffers().remove(&(start, resource))
+    else {
+        return;
+    };
+    // No list holds a title buffer's copy: `Deferred` keeps texture ids and
+    // named host objects, not these. A list reads one by binding it as vertex
+    // or index data, and an indirect mesh draw takes the address from
+    // arguments a shader wrote, so a queued list may still read memory the CPU
+    // has finished with — the console reads stale memory there. Release the
+    // copy behind the queue when this was the last reference to it.
+    if let Some(shadow) = Arc::into_inner(shadow) {
+        crate::host::release_late(shadow.buffer);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
