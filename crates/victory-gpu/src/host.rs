@@ -547,6 +547,22 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+/// Host resources whose last CPU reference went away while GPU work that may
+/// still read them was queued: a descriptor slot the title rewrote, a title
+/// buffer it released. Lists only hold what they could name, and a draw's
+/// arguments can be written by compute on the GPU, so the host cannot know a
+/// queued list has no use for a resource; the console reads stale memory
+/// instead of faulting, and a freed host resource is a GPU page fault.
+///
+/// Drained by [`Host::execute`] once the queue is idle, which is the only
+/// point where a resource is provably past use.
+static RELEASED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+/// Frees `resource` once the queue has been waited for, not now.
+pub(crate) fn release_late(resource: ID3D12Resource) {
+    RELEASED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -939,6 +955,14 @@ impl Host {
                 unsafe { self.queue.ExecuteCommandLists(&[Some(rb)]) };
                 wait_queue(&mut submitted);
             }
+        }
+        // Every list submitted above has run: anything waiting to be released
+        // is past use (`Release`, not `Drop`: the queue is idle, and the lock
+        // is held here anyway).
+        if let Some(resources) = RELEASED.lock().ok().map(|mut q| std::mem::take(&mut *q))
+            && !resources.is_empty()
+        {
+            drop(resources);
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
