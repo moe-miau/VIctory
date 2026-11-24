@@ -104,8 +104,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// The pages of `[start, end)` written, asked allocation by allocation:
 /// the kernel refuses a range over several (a title buffer spans as many
 /// allocations as the runtime made for it). Parts never committed cannot
-/// have been written. `None` if a committed part is not write-watched (or
-/// the range is one allocation, already refused).
+/// have been written, so a range none of which is committed (a reserved
+/// allocation the title has not committed yet) has no writes. `None` if a
+/// committed part is not write-watched (or the range is one committed
+/// allocation, already refused).
 fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
@@ -117,7 +119,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
         (n != 0).then_some(info)
     };
-    let (mut pages, mut at, mut allocations) = (Vec::new(), start, 0);
+    let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
     while at < end {
         let info = query(at)?;
         let base = info.AllocationBase as usize;
@@ -133,6 +135,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
             to = (next.BaseAddress as usize + next.RegionSize).min(end);
         }
         allocations += 1;
+        any |= committed;
         if committed {
             let mut count = (to - at) / KERNEL_PAGE;
             found.resize(count.max(found.len()), 0);
@@ -155,7 +158,7 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
         }
         at = to;
     }
-    (allocations > 1).then_some(pages)
+    (allocations > 1 || !any).then_some(pages)
 }
 
 /// Guarded blocks of view memory.
@@ -434,10 +437,29 @@ mod tests {
         }
         let (now, found) = writes(a, b + 2 * PAGE, false).expect("watched");
         assert_eq!(found, [(a / PAGE, now), (b / PAGE + 1, now)]);
-        for p in [a, b] {
-            // SAFETY: ours.
-            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
+    }
+
+    /// A range in an allocation reserved but not committed yet (as the
+    /// title's are before it uses them) has no writes, and is asked again
+    /// once committed.
+    #[test]
+    fn a_range_never_committed_has_no_writes() {
+        // SAFETY: a fresh write-watched reservation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
+        assert!(none.is_empty());
+        // SAFETY: committing and writing a page of our reservation.
+        unsafe {
+            assert!(!VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            ((p + 8) as *mut u8).write(1);
         }
+        let (now, found) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(p / PAGE, now)]);
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
