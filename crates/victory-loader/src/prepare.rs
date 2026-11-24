@@ -320,7 +320,8 @@ mod tests {
 
     #[test]
     fn dir64_relocations_handles_empty_or_truncated_table() {
-        let info = ImageInfo::default();
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
         let bytes = vec![0u8; 32];
         let relocs = dir64_relocations(&bytes, &info);
         assert!(relocs.is_empty());
