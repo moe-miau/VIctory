@@ -25,7 +25,8 @@ use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+/// XDSP_E_NO_DEVICE_RESOURCES: the connection's stream limit is used up.
+const NO_DEVICE_RESOURCES: HRESULT = 0x8AC8_10A2_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
@@ -160,7 +161,7 @@ pub extern "system" fn XDspActivate(
         let dsp = unsafe { &*dsp };
         let mut active = dsp.active.lock().unwrap_or_else(|e| e.into_inner());
         if *active >= dsp.max_streams {
-            return E_OUTOFMEMORY;
+            return NO_DEVICE_RESOURCES;
         }
         *active += 1;
     }
@@ -309,6 +310,42 @@ mod tests {
             S_OK
         );
         assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    /// XDspConnectWithMaximumStreamLimit: "XDspActivate returns
+    /// XDSP_E_NO_DEVICE_RESOURCES if this count is exceeded."
+    #[test]
+    fn activations_past_the_stream_limit_have_no_device_resources() {
+        let mut base = vec![0u8; 0x1_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x1_0000,
+                0,
+                1,
+                1,
+                &mut dsp
+            ),
+            S_OK
+        );
+        let transform = StreamDesc {
+            kind: 2,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        let (mut status, mut first, mut second) =
+            (std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &transform, &mut status, &mut first), S_OK);
+        assert_eq!(
+            XDspActivate(dsp, &transform, &mut status, &mut second),
+            NO_DEVICE_RESOURCES
+        );
+        assert_eq!(XDspDeactivate(first), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
 }
