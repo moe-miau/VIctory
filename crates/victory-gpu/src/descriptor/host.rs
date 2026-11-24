@@ -1029,6 +1029,49 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// A buffer view of no elements, which the host refuses (removing the
+    /// device), makes a null slot; one of an element is made as usual.
+    #[test]
+    fn buffer_views_of_no_elements_are_null() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A title buffer the view's memory lies in (its copy is made on the
+        // host; title memory is not read).
+        let (address, len) = (0x7e00_0000_0000_u64, 0x1000_u64);
+        crate::shadow::register(usize::MAX - 1, address, len);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = len as u32;
+        let placed = |unordered: bool, elements: u32| {
+            let mut desc = [0u32; 16];
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                // NumElements, StructureByteStride
+                (desc[4], desc[5]) = (elements, 16);
+            } else {
+                desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                (desc[6], desc[7]) = (elements, 16);
+            }
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        };
+        let kept = |index: u32| heap.kept.lock().unwrap()[index as usize].is_some();
+        for unordered in [false, true] {
+            heap.make_at(0, &placed(unordered, 1));
+            assert!(kept(0), "a view of an element (unordered: {unordered})");
+            heap.make_at(1, &placed(unordered, 0));
+            assert!(!kept(1), "a view of no elements (unordered: {unordered})");
+            // SAFETY: a plain device query.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(removed.is_ok(), "device removed: {removed:?} (unordered: {unordered})");
+        }
+        crate::shadow::unregister(usize::MAX - 1, address);
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
