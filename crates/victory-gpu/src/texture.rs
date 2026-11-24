@@ -513,11 +513,6 @@ mod tests {
         assert_eq!(footprint_len(&mip(0, 10, 6), 6, total), 1536);
         assert_eq!(footprint_len(&mip(1536, 5, 3), 3, total), 532);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,

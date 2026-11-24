@@ -698,10 +698,7 @@ mod tests {
             "{err}"
         );
     }
-}
 
-#[cfg(test)]
-mod tests {
     use super::Tally;
 
     #[test]
