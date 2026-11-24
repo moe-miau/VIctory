@@ -449,6 +449,94 @@ impl Host {
         })
     }
 
+    /// Host `D3D12_FEATURE_DATA_D3D12_OPTIONS5` (cached once per device).
+    pub(crate) fn options5(&self) -> D3D12_FEATURE_DATA_D3D12_OPTIONS5 {
+        static OPTIONS5: OnceLock<D3D12_FEATURE_DATA_D3D12_OPTIONS5> = OnceLock::new();
+        *OPTIONS5.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            // SAFETY: writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS5,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            if ok {
+                tracing::info!(
+                    tier = options.RaytracingTier.0,
+                    render_passes = options.RenderPassesTier.0,
+                    "host raytracing and render-pass support"
+                );
+                options
+            } else {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS5::default()
+            }
+        })
+    }
+
+    /// Host DXR tier (`0` = unsupported, `10` = Tier 1.0, `11` = Tier 1.1).
+    pub(crate) fn raytracing_tier(&self) -> u32 {
+        self.options5().RaytracingTier.0 as u32
+    }
+
+    /// `ID3D12Device5` for DXR 1.1 calls when the host supports at least Tier
+    /// 1.0 raytracing.
+    pub(crate) fn device5(&self) -> Option<ID3D12Device5> {
+        if self.raytracing_tier() < D3D12_RAYTRACING_TIER_1_0.0 as u32 {
+            return None;
+        }
+        self.device.cast::<ID3D12Device5>().ok()
+    }
+
+    /// A `DEFAULT`-heap UAV-capable buffer (used for DXR acceleration
+    /// structures and scratch buffers), aligned up to 256 bytes.
+    pub(crate) fn default_uav_buffer(
+        &self,
+        size: u64,
+        initial: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(256).next_multiple_of(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain `DEFAULT` buffer creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                initial,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default UAV buffer");
+                None
+            }
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

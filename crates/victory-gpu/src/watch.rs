@@ -215,18 +215,26 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded, and any host DXR
+/// acceleration structures backed by that range are evicted.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    if len == 0 {
+        return;
     }
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        let blocks: Vec<usize> = g
+            .protected
+            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in blocks {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+    }
+    crate::raytracing::evict_as_range(at as u64, end as u64);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

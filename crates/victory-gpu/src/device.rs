@@ -273,12 +273,14 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const OPTIONS5: u32 = 27;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        OPTIONS5 => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -318,6 +320,22 @@ extern "system" fn check_feature_support(
             // Format, sample count, flags in; one quality level out for the
             // counts the hardware has.
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            S_OK
+        }
+        OPTIONS5 => {
+            #[cfg(windows)]
+            let out = crate::host::host().map_or([0u32; 3], |h| {
+                let o = h.options5();
+                [
+                    u32::from(o.SRVOnlyTiledResourceTier3.as_bool()),
+                    o.RenderPassesTier.0 as u32,
+                    o.RaytracingTier.0 as u32,
+                ]
+            });
+            #[cfg(not(windows))]
+            let out = [0u32; 3];
+            // SAFETY: checked size (12 bytes) and non-null.
+            unsafe { data.cast::<[u32; 3]>().write_unaligned(out) };
             S_OK
         }
         _ => feature_levels(data),

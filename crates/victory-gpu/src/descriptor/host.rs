@@ -665,6 +665,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 (crate::resource::buffer_bytes(resource), desc)
             {
                 buffer_srv(data as u64, len, srv_desc(desc), at)
+            } else if resource.is_null()
+                && let Some(words) = desc
+                && words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+            {
+                let mut host_desc = srv_desc(words);
+                // SAFETY: union member selected by `RAYTRACING_ACCELERATION_STRUCTURE`.
+                let title_va = unsafe { host_desc.Anonymous.RaytracingAccelerationStructure.Location };
+                let (as_res, host_va) = crate::raytracing::lookup_as(title_va)?;
+                host_desc.Anonymous.RaytracingAccelerationStructure.Location = host_va;
+                // SAFETY: null resource is required for TLAS SRVs; `at` is our heap slot.
+                unsafe {
+                    device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&host_desc), at)
+                };
+                Some(Some(as_res))
             } else {
                 None
             }
