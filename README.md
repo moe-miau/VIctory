@@ -103,6 +103,9 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
+`translate --jobs N` requires a positive worker count. Omit it to use the
+default worker count.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 

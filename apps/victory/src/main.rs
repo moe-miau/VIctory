@@ -9,6 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -81,9 +82,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -152,7 +153,13 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+        ),
         Command::Run {
             exe,
             unimplemented,
