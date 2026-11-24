@@ -27,6 +27,8 @@ use crate::{HleModule, hle_export};
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 /// XDSP_E_NO_DEVICE_RESOURCES: the connection's stream limit is used up.
 const NO_DEVICE_RESOURCES: HRESULT = 0x8AC8_10A2_u32 as i32;
+/// XDSP_E_NOT_ALL_HANDLES_DEACTIVATED: disconnect with streams still active.
+const NOT_ALL_HANDLES_DEACTIVATED: HRESULT = 0x8AC8_10A4_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
@@ -109,12 +111,21 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     S_OK
 }
 
+/// Refuses while streams are active, as the GDK documents, since each one
+/// points at the connection. The client is kept, so the title can
+/// deactivate them and disconnect again.
 pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
     if dsp.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: made by `XDspConnectWithMaximumStreamLimit`; disconnected
-    // once, after its streams.
+    // SAFETY: made by `XDspConnectWithMaximumStreamLimit`, not disconnected.
+    let connection = unsafe { &*dsp };
+    if *connection.active.lock().unwrap_or_else(|e| e.into_inner()) != 0 {
+        return NOT_ALL_HANDLES_DEACTIVATED;
+    }
+    // Checked under the lock but freed after it: the title finishes its
+    // XDspActivate and XDspDeactivate calls on this connection before this.
+    // SAFETY: as above, and no stream points at it any more; disconnected once.
     drop(unsafe { Box::from_raw(dsp) });
     S_OK
 }
@@ -190,7 +201,7 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     }
     // SAFETY: made by `XDspActivate`; deactivated once.
     let stream = unsafe { Box::from_raw(stream) };
-    // SAFETY: the connection outlives its streams.
+    // SAFETY: `XDspDisconnect` keeps the connection while this is active.
     let dsp = unsafe { &*stream.dsp };
     *dsp.active.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     S_OK
@@ -309,6 +320,44 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    /// XDspDisconnect: "All XDSP streams must be deactivated successfully
+    /// before calling this function"; otherwise it fails with
+    /// XDSP_E_NOT_ALL_HANDLES_DEACTIVATED. We take the error to leave the
+    /// client usable.
+    #[test]
+    fn disconnect_with_an_active_stream_is_refused() {
+        let mut base = vec![0u8; 0x1_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x1_0000,
+                0,
+                1,
+                1,
+                &mut dsp
+            ),
+            S_OK
+        );
+        let transform = StreamDesc {
+            kind: 2,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(
+            XDspActivate(dsp, &transform, &mut status, &mut stream),
+            S_OK
+        );
+        assert_eq!(XDspDisconnect(dsp), NOT_ALL_HANDLES_DEACTIVATED);
+        // The client is still there for its stream.
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
