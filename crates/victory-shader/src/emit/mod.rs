@@ -196,6 +196,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -329,9 +331,36 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// How a Wave64 compute shader is mapped onto the host device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wave64Mode {
+    /// Emit native `WaveSize(64)` when compute lane semantics require it.
+    #[default]
+    Native,
+    /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
+    Wave32,
+    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    Emulate,
+}
+
+/// Options controlling DXIL emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranslateOptions {
+    pub wave64: Wave64Mode,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container with default options ([`Wave64Mode::Native`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, TranslateOptions::default())
+}
+
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container using `options`.
+pub fn translate_with(
+    container: &[u8],
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -355,10 +384,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran with default options.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -366,6 +395,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, TranslateOptions::default())
+}
+
+/// Emits a program whose earlier stages already ran using `options`.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: TranslateOptions,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -432,6 +474,7 @@ pub fn emit(
         outputs: outputs.clone(),
         prims: prims.clone(),
         mesh_stride,
+        options,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
