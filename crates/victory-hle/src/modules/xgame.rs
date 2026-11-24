@@ -74,7 +74,15 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+    // The executable is a narrow path (`GetModuleFileNameA`'s, in the ANSI
+    // code page).
+    let exe = if exe.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the title passes a NUL-terminated string.
+        super::kernel::from_ansi(unsafe { CStr::from_ptr(exe) }.to_bytes())
+    };
+    let args = text(args).unwrap_or_default();
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)

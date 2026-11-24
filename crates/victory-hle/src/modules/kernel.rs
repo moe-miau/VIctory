@@ -9,6 +9,8 @@
 
 use std::ffi::{CStr, c_void};
 
+use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar, WideCharToMultiByte};
+
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
@@ -63,10 +65,67 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
+    // The `A` functions speak the ANSI code page, as the host's do for its
+    // own modules and as our narrow file functions decode (UTF-8 turned
+    // folders outside ASCII into other names there).
     // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(path.as_bytes(), unsafe {
+    copy_truncated(&to_ansi(&path), unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
+}
+
+/// `text` in the ANSI code page (characters it lacks as `?`, as the host
+/// converts them).
+pub(crate) fn to_ansi(text: &str) -> Vec<u8> {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let len = match i32::try_from(wide.len()) {
+        Ok(0) | Err(_) => return Vec::new(),
+        Ok(len) => len,
+    };
+    let (none, no_default) = (std::ptr::null_mut(), std::ptr::null());
+    // SAFETY: sizing call, then a call with room for `n` bytes.
+    unsafe {
+        let n = WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            len,
+            none,
+            0,
+            no_default,
+            none.cast(),
+        );
+        let mut out = vec![0u8; usize::try_from(n).unwrap_or(0)];
+        let n = WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            len,
+            out.as_mut_ptr(),
+            n,
+            no_default,
+            none.cast(),
+        );
+        out.truncate(usize::try_from(n).unwrap_or(0));
+        out
+    }
+}
+
+/// The reverse of [`to_ansi`]: a narrow string from the title.
+pub(crate) fn from_ansi(bytes: &[u8]) -> String {
+    let len = match i32::try_from(bytes.len()) {
+        Ok(0) | Err(_) => return String::new(),
+        Ok(len) => len,
+    };
+    // SAFETY: sizing call, then a call with room for `n` units.
+    let wide = unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        let mut wide = vec![0u16; usize::try_from(n).unwrap_or(0)];
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        wide.truncate(usize::try_from(n).unwrap_or(0));
+        wide
+    };
+    String::from_utf16_lossy(&wide)
 }
 
 fn title_path(module: *mut c_void) -> Option<String> {
@@ -613,6 +672,28 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// A path outside ASCII comes back in the ANSI code page, as the host's
+    /// `GetModuleFileNameA` gives it, so decoding it as the title's narrow
+    /// file functions do gives the path again. It came back as UTF-8, so a
+    /// title building paths from it named other folders.
+    #[test]
+    fn a_title_image_name_is_in_the_ansi_code_page() {
+        let base = 0x7000_0001_0000;
+        let path = r"C:\Spiele\Grüße\game.exe";
+        runtime::set_image_path(base, std::path::Path::new(path));
+        let mut buf = [0xFFu8; 64];
+        let n = GetModuleFileNameA(base as *mut c_void, buf.as_mut_ptr(), buf.len() as u32);
+        let bytes = &buf[..n as usize];
+        assert_eq!(buf[n as usize], 0);
+        assert_eq!(bytes, to_ansi(path));
+        assert_eq!(from_ansi(bytes), path);
+        // SAFETY: no arguments.
+        let acp = unsafe { windows_sys::Win32::Globalization::GetACP() };
+        if acp == 1252 {
+            assert!(bytes.windows(4).any(|w| w == b"Gr\xFC\xDF"), "{bytes:02x?}");
+        }
     }
 
     fn w(text: &str) -> Vec<u16> {
