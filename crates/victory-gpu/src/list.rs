@@ -2205,8 +2205,10 @@ mod tests {
                 }
             };
 
+            let unorm = |c: [u8; 4]| c.map(|b| f32::from(b) / 255.0);
+
             // 1. Basic transition: RENDER_TARGET -> COPY_SOURCE without ensure_state.
-            clear_rtv(list1, rtv, &[0.25, 0.5, 0.75, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &unorm([64, 128, 191, 255]), 0, null.cast());
             let b1 = tex_barrier(
                 D3D12_BARRIER_SYNC_RENDER_TARGET,
                 D3D12_BARRIER_SYNC_COPY,
@@ -2230,7 +2232,7 @@ mod tests {
 
             // 2. Split-begin skipped, split-end transitions.
             assert_eq!(reset(list1, allocator1, null), S_OK);
-            clear_rtv(list1, rtv, &[0.5, 0.25, 1.0, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &unorm([128, 64, 255, 255]), 0, null.cast());
             let b_split_begin = tex_barrier(
                 D3D12_BARRIER_SYNC_RENDER_TARGET,
                 D3D12_BARRIER_SYNC_SPLIT,
@@ -2250,7 +2252,7 @@ mod tests {
             unsafe {
                 host_list(list1).unwrap().list.ClearRenderTargetView(
                     host.rtv(host_tex, None),
-                    &[1.0, 0.5, 0.25, 1.0],
+                    &unorm([255, 128, 64, 255]),
                     None,
                 );
             }
@@ -2277,7 +2279,7 @@ mod tests {
 
             // 3. Duplicate-texture transitions in one Barrier() call + UAV ordering.
             assert_eq!(reset(list1, allocator1, null), S_OK);
-            clear_rtv(list1, rtv, &[0.0, 1.0, 0.5, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &unorm([0, 255, 128, 255]), 0, null.cast());
             let dup = [
                 tex_barrier(
                     D3D12_BARRIER_SYNC_RENDER_TARGET,
@@ -2318,7 +2320,7 @@ mod tests {
             );
             let list2 = new_newer_list(allocator2);
 
-            clear_rtv(list1, rtv, &[0.75, 0.25, 0.5, 1.0], 0, null.cast());
+            clear_rtv(list1, rtv, &unorm([191, 64, 128, 255]), 0, null.cast());
             let b_to_srv = tex_barrier(
                 D3D12_BARRIER_SYNC_RENDER_TARGET,
                 D3D12_BARRIER_SYNC_ALL_SHADING,
