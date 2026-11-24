@@ -1,0 +1,18 @@
+[package]
+name = "victory-launcher"
+description = "GUI launcher for running Xbox Series titles through VIctory."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+eframe = "0.31"
+rfd = "0.15"
+
+[lints]
+workspace = true
