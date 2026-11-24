@@ -12,6 +12,224 @@
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
 
+/// Console-only primitive topologies expanded into standard D3D12 triangle or
+/// line list index buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandedTopology {
+    TriangleFan,
+    LineLoop,
+    Quads,
+    QuadStrip,
+}
+
+impl ExpandedTopology {
+    const TRIANGLE_FAN: u32 = 6;
+    const LINE_LOOP: u32 = 18;
+    const QUADS: u32 = 19;
+    const QUAD_STRIP: u32 = 20;
+
+    /// Returns the expanded console topology kind, or `None` for standard PC
+    /// topologies and `RECTANGLES` (handled via vertex expansion).
+    pub(crate) fn from_console(topology: u32) -> Option<Self> {
+        match topology {
+            Self::TRIANGLE_FAN => Some(Self::TriangleFan),
+            Self::LINE_LOOP => Some(Self::LineLoop),
+            Self::QUADS => Some(Self::Quads),
+            Self::QUAD_STRIP => Some(Self::QuadStrip),
+            _ => None,
+        }
+    }
+
+    /// Standard D3D12 primitive topology value (`LINELIST = 2`, `TRIANGLELIST = 4`).
+    pub(crate) fn host_topology(self) -> u32 {
+        match self {
+            Self::LineLoop => 2,
+            Self::TriangleFan | Self::Quads | Self::QuadStrip => 4,
+        }
+    }
+
+    /// Maximum number of indices emitted for `count` input vertices or indices.
+    pub(crate) fn max_output_indices(self, count: u32) -> u32 {
+        match self {
+            Self::TriangleFan => count.saturating_sub(2).saturating_mul(3),
+            Self::LineLoop => {
+                if count >= 2 {
+                    count.saturating_mul(2)
+                } else {
+                    0
+                }
+            }
+            Self::Quads => (count / 4).saturating_mul(6),
+            Self::QuadStrip => {
+                if count >= 4 {
+                    ((count - 2) / 2).saturating_mul(6)
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Expands `count` sequential 16-bit vertex indices starting at `start`.
+    pub(crate) fn expand_non_indexed_u16(self, count: u32, start: u16, dst: &mut [u16]) -> usize {
+        expand_indices(
+            self,
+            (0..count).map(|i| start.wrapping_add(i as u16)),
+            None,
+            start,
+            dst,
+        )
+    }
+
+    /// Expands `count` sequential 32-bit vertex indices starting at `start`.
+    pub(crate) fn expand_non_indexed_u32(self, count: u32, start: u32, dst: &mut [u32]) -> usize {
+        expand_indices(
+            self,
+            (0..count).map(|i| start.wrapping_add(i)),
+            None,
+            start,
+            dst,
+        )
+    }
+
+    /// Expands 16-bit indices from `src`, honoring optional strip-cut `cut` and
+    /// padding unused tail slots with degenerate primitives.
+    pub(crate) fn expand_indexed_u16(
+        self,
+        src: &[u16],
+        cut: Option<u16>,
+        fallback_pad: u16,
+        dst: &mut [u16],
+    ) -> usize {
+        expand_indices(self, src.iter().copied(), cut, fallback_pad, dst)
+    }
+
+    /// Expands 32-bit indices from `src`, honoring optional strip-cut `cut` and
+    /// padding unused tail slots with degenerate primitives.
+    pub(crate) fn expand_indexed_u32(
+        self,
+        src: &[u32],
+        cut: Option<u32>,
+        fallback_pad: u32,
+        dst: &mut [u32],
+    ) -> usize {
+        expand_indices(self, src.iter().copied(), cut, fallback_pad, dst)
+    }
+}
+
+fn expand_indices<T: Copy + Eq>(
+    kind: ExpandedTopology,
+    indices: impl IntoIterator<Item = T>,
+    cut: Option<T>,
+    fallback_pad: T,
+    dst: &mut [T],
+) -> usize {
+    let mut written = 0usize;
+    let mut emit = |slice: &[T]| {
+        if written + slice.len() <= dst.len() {
+            dst[written..written + slice.len()].copy_from_slice(slice);
+            written += slice.len();
+        }
+    };
+    match kind {
+        ExpandedTopology::TriangleFan => {
+            let mut pivot = None;
+            let mut prev = None;
+            for v in indices {
+                if cut == Some(v) {
+                    pivot = None;
+                    prev = None;
+                    continue;
+                }
+                match (pivot, prev) {
+                    (None, _) => pivot = Some(v),
+                    (Some(_), None) => prev = Some(v),
+                    (Some(p), Some(q)) => {
+                        emit(&[p, q, v]);
+                        prev = Some(v);
+                    }
+                }
+            }
+        }
+        ExpandedTopology::LineLoop => {
+            let mut first = None;
+            let mut prev = None;
+            let mut run_len = 0usize;
+            for v in indices {
+                if cut == Some(v) {
+                    if run_len >= 2
+                        && let (Some(f), Some(p)) = (first, prev)
+                    {
+                        emit(&[p, f]);
+                    }
+                    first = None;
+                    prev = None;
+                    run_len = 0;
+                    continue;
+                }
+                if let Some(p) = prev {
+                    emit(&[p, v]);
+                } else {
+                    first = Some(v);
+                }
+                prev = Some(v);
+                run_len += 1;
+            }
+            if run_len >= 2
+                && let (Some(f), Some(p)) = (first, prev)
+            {
+                emit(&[p, f]);
+            }
+        }
+        ExpandedTopology::Quads => {
+            let mut q = [None; 3];
+            let mut len = 0usize;
+            for v in indices {
+                if cut == Some(v) {
+                    len = 0;
+                    continue;
+                }
+                if len < 3 {
+                    q[len] = Some(v);
+                    len += 1;
+                } else if let [Some(v0), Some(v1), Some(v2)] = q {
+                    emit(&[v0, v1, v2, v0, v2, v]);
+                    len = 0;
+                }
+            }
+        }
+        ExpandedTopology::QuadStrip => {
+            let mut a = None;
+            let mut b = None;
+            let mut c = None;
+            for v in indices {
+                if cut == Some(v) {
+                    a = None;
+                    b = None;
+                    c = None;
+                    continue;
+                }
+                match (a, b, c) {
+                    (None, _, _) => a = Some(v),
+                    (Some(_), None, _) => b = Some(v),
+                    (Some(_), Some(_), None) => c = Some(v),
+                    (Some(v0), Some(v1), Some(v2)) => {
+                        emit(&[v0, v1, v, v0, v, v2]);
+                        a = Some(v2);
+                        b = Some(v);
+                        c = None;
+                    }
+                }
+            }
+        }
+    }
+    if written < dst.len() {
+        let pad = if written > 0 { dst[0] } else { fallback_pad };
+        dst[written..].fill(pad);
+    }
+    written
+}
+
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
@@ -227,5 +445,462 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn expand_non_indexed_topologies() {
+        // QUADS: 2 quads + 1 trailing vertex ignored.
+        let mut out = vec![0u32; ExpandedTopology::Quads.max_output_indices(9) as usize];
+        assert_eq!(out.len(), 12);
+        let n = ExpandedTopology::Quads.expand_non_indexed_u32(9, 10, &mut out);
+        assert_eq!(n, 12);
+        assert_eq!(out, [10, 11, 12, 10, 12, 13, 14, 15, 16, 14, 16, 17]);
+
+        // QUAD_STRIP: 6 vertices -> 2 quads with consistent winding, 7th ignored.
+        let mut out = vec![0u16; ExpandedTopology::QuadStrip.max_output_indices(7) as usize];
+        assert_eq!(out.len(), 12);
+        let n = ExpandedTopology::QuadStrip.expand_non_indexed_u16(7, 0, &mut out);
+        assert_eq!(n, 12);
+        assert_eq!(out, [0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
+
+        // TRIANGLE_FAN: 5 vertices -> 3 triangles sharing pivot 0.
+        let mut out = vec![0u32; ExpandedTopology::TriangleFan.max_output_indices(5) as usize];
+        assert_eq!(out.len(), 9);
+        assert_eq!(
+            ExpandedTopology::TriangleFan.expand_non_indexed_u32(5, 0, &mut out),
+            9
+        );
+        assert_eq!(out, [0, 1, 2, 0, 2, 3, 0, 3, 4]);
+        assert_eq!(ExpandedTopology::TriangleFan.max_output_indices(2), 0);
+
+        // LINE_LOOP: 4 vertices -> 4 segments closing 3 -> 0.
+        let mut out = vec![0u16; ExpandedTopology::LineLoop.max_output_indices(4) as usize];
+        assert_eq!(out.len(), 8);
+        assert_eq!(
+            ExpandedTopology::LineLoop.expand_non_indexed_u16(4, 1, &mut out),
+            8
+        );
+        assert_eq!(out, [1, 2, 2, 3, 3, 4, 4, 1]);
+        assert_eq!(ExpandedTopology::LineLoop.max_output_indices(1), 0);
+    }
+
+    #[test]
+    fn expand_indexed_topologies_with_strip_cuts() {
+        // TRIANGLE_FAN (16-bit, 0xFFFF cut): two fans separated by cut + incomplete tail.
+        let src: [u16; 10] = [0, 1, 2, 3, u16::MAX, 10, 11, 12, u16::MAX, 20];
+        let mut out = vec![0u16; ExpandedTopology::TriangleFan.max_output_indices(10) as usize];
+        let n = ExpandedTopology::TriangleFan.expand_indexed_u16(&src, Some(u16::MAX), 0, &mut out);
+        assert_eq!(n, 9);
+        assert_eq!(&out[..9], [0, 1, 2, 0, 2, 3, 10, 11, 12]);
+        assert!(out[9..].iter().all(|&i| i == 0), "degenerate tail padding");
+
+        // QUAD_STRIP (32-bit, 0xFFFFFFFF cut): two 4-vertex strips separated by cut.
+        let src32: [u32; 9] = [0, 1, 2, 3, u32::MAX, 4, 5, 6, 7];
+        let mut out32 = vec![0u32; ExpandedTopology::QuadStrip.max_output_indices(9) as usize];
+        let n =
+            ExpandedTopology::QuadStrip.expand_indexed_u32(&src32, Some(u32::MAX), 0, &mut out32);
+        assert_eq!(n, 12);
+        assert_eq!(&out32[..12], [0, 1, 3, 0, 3, 2, 4, 5, 7, 4, 7, 6]);
+        assert!(out32[12..].iter().all(|&i| i == 0));
+
+        // QUADS (16-bit cut discards incomplete 2-vertex quad before cut).
+        let qsrc: [u16; 7] = [0, 1, u16::MAX, 2, 3, 4, 5];
+        let mut qout = vec![0u16; ExpandedTopology::Quads.max_output_indices(7) as usize];
+        let n = ExpandedTopology::Quads.expand_indexed_u16(&qsrc, Some(u16::MAX), 0, &mut qout);
+        assert_eq!(n, 6);
+        assert_eq!(qout, [2, 3, 4, 2, 4, 5]);
+
+        // LINE_LOOP (16-bit cut closes first loop before starting second).
+        let lsrc: [u16; 7] = [0, 1, 2, u16::MAX, 5, 6, 7];
+        let mut lout = vec![0u16; ExpandedTopology::LineLoop.max_output_indices(7) as usize];
+        let n = ExpandedTopology::LineLoop.expand_indexed_u16(&lsrc, Some(u16::MAX), 0, &mut lout);
+        assert_eq!(n, 12);
+        assert_eq!(&lout[..12], [0, 1, 1, 2, 2, 0, 5, 6, 6, 7, 7, 5]);
+        assert_eq!(&lout[12..], [0, 0]);
+    }
+
+    #[cfg(windows)]
+    fn render_topology_test(
+        topology_type: windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+        host_topology: u32,
+        strip_cut: windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+        vertices: &[[f32; 2]],
+        draw_calls: &[(&[u16], i32)],
+    ) -> Option<Vec<[u8; 4]>> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+
+        let host = crate::host::host()?;
+        const HLSL: &str = r#"
+float4 vs_main(float2 pos : POSITION) : SV_Position { return float4(pos, 0.0, 1.0); }
+float4 ps_main() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }
+"#;
+        let compile = |entry: windows::core::PCSTR, target: windows::core::PCSTR| -> Vec<u8> {
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: static shader source and entry point strings.
+            unsafe {
+                D3DCompile(
+                    HLSL.as_ptr().cast(),
+                    HLSL.len(),
+                    s!("topology_test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+                let blob = blob.unwrap();
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+                .to_vec()
+            }
+        };
+        let vs = compile(s!("vs_main"), s!("vs_5_0"));
+        let ps = compile(s!("ps_main"), s!("ps_5_0"));
+
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            ..Default::default()
+        };
+        let mut rs_blob: Option<ID3DBlob> = None;
+        // SAFETY: plain root signature, PSO, RT, and readback creation.
+        let (root, pso, rt, readback, vb, vb_gpu) = unsafe {
+            D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut rs_blob, None)
+                .unwrap();
+            let rs_blob = rs_blob.unwrap();
+            let rs_bytes = std::slice::from_raw_parts(
+                rs_blob.GetBufferPointer().cast::<u8>(),
+                rs_blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, rs_bytes).unwrap();
+            let elem = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: s!("POSITION"),
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                ..Default::default()
+            };
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let mut rast = D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_BACK,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            };
+            if topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE {
+                rast.CullMode = D3D12_CULL_MODE_NONE;
+            }
+            let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                },
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: rast,
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: &elem,
+                    NumElements: 1,
+                },
+                IBStripCutValue: strip_cut,
+                PrimitiveTopologyType: topology_type,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let pso: ID3D12PipelineState =
+                host.device.CreateGraphicsPipelineState(&pso_desc).unwrap();
+
+            let rt_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 8,
+                Height: 8,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let def_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut rt: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &def_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rt_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut rt,
+                )
+                .unwrap();
+            let rt = rt.unwrap();
+
+            let rb_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256 * 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let rb_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &rb_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rb_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+            let readback = readback.unwrap();
+
+            let vb_bytes = std::mem::size_of_val(vertices) as u64;
+            let (vb, vb_ptr) = host.upload_buffer(vb_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr().cast::<u8>(),
+                vb_ptr,
+                vb_bytes as usize,
+            );
+            let vb_gpu = vb.GetGPUVirtualAddress();
+            (root, pso, rt, readback, vb, vb_gpu)
+        };
+
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(&rt, None);
+        // SAFETY: open command list, live resources, valid scratch index views.
+        unsafe {
+            let l = &list.list;
+            l.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], None);
+            l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 8.0,
+                Height: 8.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            l.RSSetScissorRects(&[RECT {
+                right: 8,
+                bottom: 8,
+                ..Default::default()
+            }]);
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host_topology as i32));
+            l.IASetVertexBuffers(
+                0,
+                Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: vb_gpu,
+                    SizeInBytes: std::mem::size_of_val(vertices) as u32,
+                    StrideInBytes: 8,
+                }]),
+            );
+            for &(indices, base) in draw_calls {
+                let bytes = (indices.len() * 2) as u64;
+                let (ib_gpu, ib_ptr) = list.scratch(bytes).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    indices.as_ptr().cast::<u8>(),
+                    ib_ptr,
+                    bytes as usize,
+                );
+                l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: ib_gpu,
+                    SizeInBytes: bytes as u32,
+                    Format: DXGI_FORMAT_R16_UINT,
+                }));
+                l.DrawIndexedInstanced(indices.len() as u32, 1, 0, base, 0);
+            }
+            l.ResourceBarrier(&[crate::host::transition(
+                &rt,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Width: 8,
+                            Height: 8,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&rt),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        drop(vb);
+
+        let mut data = std::ptr::null_mut();
+        // SAFETY: `host.execute` waited for the GPU copy into `readback`.
+        let pixels = unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let mut out = Vec::with_capacity(64);
+            for y in 0..8usize {
+                let row = std::slice::from_raw_parts(data.cast::<u8>().add(y * 256), 32);
+                for x in 0..8usize {
+                    out.push([row[x * 4], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]]);
+                }
+            }
+            readback.Unmap(0, None);
+            out
+        };
+        Some(pixels)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quads_and_strip_cut_triangle_fan_render_with_backface_culling() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        // Vertices in clockwise NDC order (front-facing under D3D12_CULL_MODE_BACK):
+        // 0..4: non-indexed QUADS covering left half (x: -1..0, y: -1..1).
+        // 4..8: indexed TRIANGLE_FAN #1 covering top-right (x: 0.25..1, y: 0.25..1).
+        // 8..11: indexed TRIANGLE_FAN #2 covering bottom-right (x: 0.25..1, y: -1..-0.25).
+        let vertices: [[f32; 2]; 11] = [
+            [-1.0, 1.0],
+            [0.0, 1.0],
+            [0.0, -1.0],
+            [-1.0, -1.0],
+            [0.25, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.25],
+            [0.25, 0.25],
+            [0.25, -0.25],
+            [1.0, -0.25],
+            [1.0, -1.0],
+        ];
+        let mut quad_ib = vec![0u16; ExpandedTopology::Quads.max_output_indices(4) as usize];
+        ExpandedTopology::Quads.expand_non_indexed_u16(4, 0, &mut quad_ib);
+
+        let fan_src: [u16; 8] = [4, 5, 6, 7, u16::MAX, 8, 9, 10];
+        let mut fan_ib = vec![0u16; ExpandedTopology::TriangleFan.max_output_indices(8) as usize];
+        ExpandedTopology::TriangleFan.expand_indexed_u16(&fan_src, Some(u16::MAX), 0, &mut fan_ib);
+
+        let Some(px) = render_topology_test(
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ExpandedTopology::Quads.host_topology(),
+            D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF,
+            &vertices,
+            &[(&quad_ib, 0), (&fan_ib, 0)],
+        ) else {
+            return;
+        };
+        let at = |x: usize, y: usize| px[y * 8 + x][0];
+        // Both triangles of the left-half quad must rasterize (not backface-culled).
+        assert_eq!(at(1, 1), 255, "quad first triangle");
+        assert_eq!(at(1, 6), 255, "quad second triangle");
+        // Both strip-cut-separated triangle fans on the right half must rasterize.
+        assert_eq!(at(6, 1), 255, "first triangle fan");
+        assert_eq!(at(7, 6), 255, "second triangle fan after strip cut");
+        // Middle gap between the two fans must stay black (strip cut did not bridge).
+        assert_eq!(at(6, 4), 0, "gap between strip-cut fans stays black");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quad_strip_and_line_loop_render_on_gpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        // Indexed QUAD_STRIP with 6 vertices (2 quads, CW front-facing under CULL_MODE_BACK)
+        // covering the entire 8x8 target.
+        let strip_verts: [[f32; 2]; 6] = [
+            [-1.0, -1.0],
+            [-1.0, 1.0],
+            [0.0, -1.0],
+            [0.0, 1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+        ];
+        let strip_src: [u16; 6] = [0, 1, 2, 3, 4, 5];
+        let mut strip_ib = vec![0u16; ExpandedTopology::QuadStrip.max_output_indices(6) as usize];
+        ExpandedTopology::QuadStrip.expand_indexed_u16(&strip_src, None, 0, &mut strip_ib);
+
+        let Some(px) = render_topology_test(
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ExpandedTopology::QuadStrip.host_topology(),
+            D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+            &strip_verts,
+            &[(&strip_ib, 0)],
+        ) else {
+            return;
+        };
+        let pat = |x: usize, y: usize| px[y * 8 + x][0];
+        assert_eq!(pat(1, 1), 255, "quad strip quad 0");
+        assert_eq!(pat(6, 6), 255, "quad strip quad 1");
+
+        // LINE_LOOP drawing the perimeter of pixel centers (1,1)->(6,1)->(6,6)->(1,6)->(1,1).
+        let to_ndc = |p: f32| (p + 0.5) / 8.0 * 2.0 - 1.0;
+        let loop_verts: [[f32; 2]; 4] = [
+            [to_ndc(1.0), -to_ndc(1.0)],
+            [to_ndc(6.0), -to_ndc(1.0)],
+            [to_ndc(6.0), -to_ndc(6.0)],
+            [to_ndc(1.0), -to_ndc(6.0)],
+        ];
+        let mut loop_ib = vec![0u16; ExpandedTopology::LineLoop.max_output_indices(4) as usize];
+        ExpandedTopology::LineLoop.expand_non_indexed_u16(4, 0, &mut loop_ib);
+
+        let Some(lpx) = render_topology_test(
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+            ExpandedTopology::LineLoop.host_topology(),
+            D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+            &loop_verts,
+            &[(&loop_ib, 0)],
+        ) else {
+            return;
+        };
+        let lat = |x: usize, y: usize| lpx[y * 8 + x][0];
+        assert_eq!(lat(3, 1), 255, "top edge");
+        assert_eq!(lat(6, 3), 255, "right edge");
+        assert_eq!(lat(3, 6), 255, "bottom edge");
+        assert_eq!(lat(1, 3), 255, "closing edge v3 -> v0");
+        assert_eq!(lat(3, 3), 0, "interior stays black");
     }
 }
