@@ -206,14 +206,38 @@ fn show_config() -> Result<()> {
 
 /// Paths given on the command line, or the configured game + test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
+    let resolved = if !paths.is_empty() {
+        paths
+    } else {
+        let cfg = victory_core::Config::load()?;
+        let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+        anyhow::ensure!(
+            !all.is_empty(),
+            "no paths given and none configured (see victory.example.toml)"
+        );
+        all
+    };
+    for p in &resolved {
+        victory_core::ensure_outside_repo(p)?;
     }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_paths_enforces_outside_repo() {
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let err = default_paths(vec![inside]).unwrap_err();
+        assert!(err.to_string().contains("inside"));
+    }
+
+    #[test]
+    fn default_paths_accepts_outside_path() {
+        let outside = std::env::temp_dir();
+        let res = default_paths(vec![outside.clone()]).unwrap();
+        assert_eq!(res, vec![outside]);
+    }
 }
