@@ -5715,7 +5715,8 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
-        if matches!(src, Source::Loaded { .. }) {
+        // Every source but a root view is a heap handle (see `handle`).
+        if !matches!(src, Source::Built { .. }) {
             self.s.flags |= flags::ATOMIC_INT64_HEAP;
         }
         let pair = |l: &mut Self, r: u8| -> Result<V, Why> {
@@ -5747,11 +5748,16 @@ impl<'a> Lower<'a> {
             }
             _ => self.handle(site, src, false, props)?,
         };
+        // cmpswap: data is (new, compare), a pair each; built before the
+        // guard, in the block `pair` writes to.
+        let cmp = if code == u32::MAX {
+            Some(pair(self, reg + 2)?)
+        } else {
+            None
+        };
         let at = self.begin_guarded(guard);
         let mut args = vec![h];
-        let r = if code == u32::MAX {
-            // cmpswap: data is (new, compare), a pair each.
-            let cmp = pair(self, reg + 2)?;
+        let r = if let Some(cmp) = cmp {
             args.extend(cs);
             args.extend([cmp, value]);
             self.s.op(
