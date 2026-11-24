@@ -72,10 +72,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        if !guarded {
-            return None;
+        match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
+            Some(pages) => pages,
+            None if !guarded => return None,
+            None => guard(first * PAGE, last * PAGE)?,
         }
-        guard(first * PAGE, last * PAGE)?
     } else {
         Vec::new()
     };
@@ -98,6 +99,63 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The pages of `[start, end)` written, asked allocation by allocation:
+/// the kernel refuses a range over several (a title buffer spans as many
+/// allocations as the runtime made for it). Parts never committed cannot
+/// have been written. `None` if a committed part is not write-watched (or
+/// the range is one allocation, already refused).
+fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let query = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query about an address; nothing is dereferenced.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let (mut pages, mut at, mut allocations) = (Vec::new(), start, 0);
+    while at < end {
+        let info = query(at)?;
+        let base = info.AllocationBase as usize;
+        let mut committed = info.State == MEM_COMMIT;
+        let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
+        // The rest of the allocation's regions in the range.
+        while info.State != MEM_FREE && to < end {
+            let next = query(to)?;
+            if next.State == MEM_FREE || next.AllocationBase as usize != base {
+                break;
+            }
+            committed |= next.State == MEM_COMMIT;
+            to = (next.BaseAddress as usize + next.RegionSize).min(end);
+        }
+        allocations += 1;
+        if committed {
+            let mut count = (to - at) / KERNEL_PAGE;
+            found.resize(count.max(found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    at as *const _,
+                    to - at,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if failed {
+                return None;
+            }
+            pages.extend(found[..count].iter().map(|&a| a / PAGE));
+        }
+        at = to;
+    }
+    (allocations > 1).then_some(pages)
 }
 
 /// Guarded blocks of view memory.
@@ -332,6 +390,54 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two write-watched allocations side by side (the runtime reserves
+    /// title memory allocation by allocation), asked about as one range, as
+    /// a buffer spanning them is: the pages written in each are reported.
+    #[test]
+    fn a_range_over_several_watched_allocations_is_watched() {
+        let (a, b) = loop {
+            // SAFETY: a probe reservation, released at once to find room for two.
+            let span =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!span.is_null());
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(span, 0, MEM_RELEASE) };
+            let at = |p: usize| {
+                // SAFETY: a fixed address in the room just released.
+                let got = unsafe {
+                    VirtualAlloc(
+                        p as *const _,
+                        2 * PAGE,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                };
+                got as usize
+            };
+            let a = at(span as usize);
+            let b = at(span as usize + 2 * PAGE);
+            if a != 0 && b != 0 {
+                break (a, b);
+            }
+            for p in [a, b].into_iter().filter(|&p| p != 0) {
+                // SAFETY: ours.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            }
+        };
+        let _ = writes(a, b + 2 * PAGE, false);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((a + 8) as *mut u8).write(1);
+            ((b + PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, found) = writes(a, b + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(a / PAGE, now), (b / PAGE + 1, now)]);
+        for p in [a, b] {
+            // SAFETY: ours.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
