@@ -168,6 +168,11 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn current_pipeline(&self) -> This {
+        self.pipeline as This
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
