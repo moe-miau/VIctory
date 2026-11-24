@@ -975,3 +975,47 @@ fn thread_group_info_bits_above_the_wave_count_are_refused() {
     let body = [sop2(0x0E, 7, 6, 0xFF), 0xFFFF, vop1(0x001, 0, sgpr(7))];
     assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_err());
 }
+
+#[test]
+fn thread_group_info_mask_may_come_first() {
+    // s_and_b32 s7, 63, s6 (the order ACO writes it).
+    let body = [sop2(0x0E, 7, 128 + 63, 6), vop1(0x001, 0, sgpr(7))];
+    let shader = lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).expect("lower");
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 2, "{backend}");
+    });
+}
+
+/// `s_cmp_eq_u32 s0, s1; s_cbranch_scc1 join; s_mov_b32 s6, 0; join: <tail>`:
+/// the thread-group info reaches `tail` through a phi when the branch is taken.
+fn tg_info_through_phi(tail: &[u32]) -> Vec<u32> {
+    let mut body = vec![0xBF06_0100, 0xBF85_0001, s_mov_b32(6, 128)];
+    body.extend_from_slice(tail);
+    body
+}
+
+#[test]
+fn thread_group_info_full_width_read_after_a_phi_is_refused() {
+    let body = tg_info_through_phi(&[vop1(0x001, 0, sgpr(6))]);
+    assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_err());
+    // Through a plain copy as well.
+    let body = tg_info_through_phi(&[s_mov_b32(7, 6), vop1(0x001, 0, sgpr(7))]);
+    assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_err());
+}
+
+#[test]
+fn thread_group_info_masked_after_a_phi_is_accepted() {
+    let body = tg_info_through_phi(&[sop2(0x0E, 7, 6, 128 + 63), vop1(0x001, 0, sgpr(7))]);
+    let shader = lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).expect("lower");
+    // s0 == s1: the info reaches the join, masked to the wave count.
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 2, "{backend}");
+    });
+    // A copy first, then the mask.
+    let body = tg_info_through_phi(&[
+        s_mov_b32(7, 6),
+        sop2(0x0E, 7, 7, 128 + 63),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_ok());
+}

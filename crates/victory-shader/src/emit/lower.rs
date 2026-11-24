@@ -1009,16 +1009,41 @@ impl<'a> Lower<'a> {
             Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
             _ => None,
         };
+        // The entry value reaches readers through phis and plain copies, so
+        // follow both before looking at who reads it.
+        let mut held = HashSet::from([v]);
+        loop {
+            let n = held.len();
+            for b in &self.x.p.blocks {
+                for p in &b.phis {
+                    if p.args.iter().any(|a| held.contains(a)) {
+                        held.insert(p.value);
+                    }
+                }
+                for i in &b.insts {
+                    if i.name() == "s_mov_b32" && i.reads.iter().any(|r| held.contains(&r.1)) {
+                        held.extend(i.writes.iter().map(|w| w.1));
+                    }
+                }
+            }
+            if held.len() == n {
+                break;
+            }
+        }
         let only_count = self.x.p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
+            if i.name() == "s_mov_b32" || !i.reads.iter().any(|r| held.contains(&r.1)) {
                 return true;
             }
             let Fields::Sop { src, .. } = &i.fields else {
                 return false;
             };
-            match (i.name(), src.get(1).and_then(low)) {
-                ("s_and_b32", Some(mask)) => mask & !0x3F == 0,
-                ("s_bfe_u32", Some(k)) => (k & 31) + (k >> 16 & 0x7F) <= 6,
+            // The mask may come first (as ACO writes it) or second.
+            match i.name() {
+                "s_and_b32" => src.iter().take(2).filter_map(low).any(|m| m & !0x3F == 0),
+                "s_bfe_u32" => src
+                    .get(1)
+                    .and_then(low)
+                    .is_some_and(|k| (k & 31) + (k >> 16 & 0x7F) <= 6),
                 _ => false,
             }
         });
