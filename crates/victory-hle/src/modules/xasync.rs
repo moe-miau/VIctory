@@ -197,6 +197,10 @@ pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
+    /// Callbacks a dispatcher has already taken off a port. Termination
+    /// must not report completion while one of these still runs.
+    running: Mutex<usize>,
+    idle: Condvar,
 }
 
 impl Queue {
@@ -205,7 +209,25 @@ impl Queue {
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
+            running: Mutex::new(0),
+            idle: Condvar::new(),
         })
+    }
+
+    /// Runs a task while counting it as in flight, then wakes waiters.
+    fn run(&self, task: Task, canceled: bool) {
+        *lock(&self.running) += 1;
+        task.run(canceled);
+        let mut running = lock(&self.running);
+        *running -= 1;
+        if *running == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn wait_idle(&self) {
+        let running = lock(&self.running);
+        drop(self.idle.wait_while(running, |n| *n != 0));
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
@@ -350,7 +372,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
-            task.run(false);
+            queue.run(task, false);
             true
         }
         None => false,
@@ -374,7 +396,7 @@ pub fn XTaskQueueSubmitDelayedCallback(
 /// work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
@@ -389,11 +411,27 @@ pub fn XTaskQueueTerminate(
         // on.) After the lock above, so none misses both flag and wake.
         port.ready.notify_all();
         for task in pending {
-            task.run(true);
+            queue.run(task, true);
         }
     }
     if let Some(callback) = callback {
-        callback(context);
+        if wait {
+            queue.wait_idle();
+            callback(context);
+        } else if *lock(&queue.running) == 0 {
+            callback(context);
+        } else {
+            // A dispatcher still owns a callback: report termination once
+            // it finishes, without blocking this call.
+            let (context, callback) = (context as usize, callback as usize);
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                queue.wait_idle();
+                // SAFETY: stored from the caller's `TerminatedCallback`.
+                let callback: TerminatedCallback = unsafe { std::mem::transmute(callback) };
+                callback(context as *mut c_void);
+            });
+        }
     }
     S_OK
 }
@@ -1416,6 +1454,60 @@ mod tests {
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
             E_ABORT
         );
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn termination_waits_for_a_running_callback() {
+        extern "system" fn blocked(context: *mut c_void, _: bool) {
+            // SAFETY: the test owns this pair of flags.
+            let (started, release) = unsafe { &*(context.cast::<(AtomicBool, AtomicBool)>()) };
+            started.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+        static TERMINATED: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn terminated(_: *mut c_void) {
+            TERMINATED.fetch_add(1, Ordering::SeqCst);
+        }
+        struct Handle(*const Queue);
+        // SAFETY: the queue outlives the dispatcher thread.
+        unsafe impl Send for Handle {}
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let flags = Box::new((AtomicBool::new(false), AtomicBool::new(false)));
+        let context = Box::into_raw(flags);
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, COMPLETION, 0, context.cast(), Some(blocked)),
+            S_OK
+        );
+        let handle = Handle(q);
+        fn dispatch(handle: Handle) -> bool {
+            XTaskQueueDispatch(handle.0, COMPLETION, 2_000)
+        }
+        let dispatcher = std::thread::spawn(move || dispatch(handle));
+        // SAFETY: the box is still alive and owned by this test.
+        while !unsafe { (*context).0.load(Ordering::SeqCst) } {
+            std::thread::yield_now();
+        }
+        TERMINATED.store(0, Ordering::SeqCst);
+        assert_eq!(
+            XTaskQueueTerminate(q, false, std::ptr::null_mut(), Some(terminated)),
+            S_OK
+        );
+        assert_eq!(TERMINATED.load(Ordering::SeqCst), 0, "callback still running");
+        // SAFETY: still owned by this test.
+        unsafe { (*context).1.store(true, Ordering::SeqCst) };
+        assert!(dispatcher.join().is_ok());
+        let start = std::time::Instant::now();
+        while TERMINATED.load(Ordering::SeqCst) == 0 && start.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(TERMINATED.load(Ordering::SeqCst), 1, "reported once, after the callback");
+        // SAFETY: no thread uses the flags now.
+        drop(unsafe { Box::from_raw(context) });
         XTaskQueueCloseHandle(q);
     }
 }
