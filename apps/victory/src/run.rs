@@ -18,11 +18,7 @@ pub fn run(
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
     if !title_args.is_empty() {
-        tracing::info!(
-            count = title_args.len(),
-            ?title_args,
-            "title command-line arguments"
-        );
+        println!("title args     {}", title_args.join(" "));
     }
 
     // A title that relaunched itself: the old process must be gone first.
