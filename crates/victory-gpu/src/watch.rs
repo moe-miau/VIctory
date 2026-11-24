@@ -72,7 +72,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
+        let mut lost = Vec::new();
+        let again = by_allocation(first * PAGE, last * PAGE, &mut j.found, &mut lost);
+        if !lost.is_empty() {
+            j.asked += 1;
+            let now = j.asked;
+            for page in lost {
+                j.written.insert(page, now);
+            }
+        }
+        match again {
             Some(pages) => pages,
             None if !guarded => return None,
             None => guard(first * PAGE, last * PAGE)?,
@@ -107,8 +116,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// have been written, so a range none of which is committed (a reserved
 /// allocation the title has not committed yet) has no writes. `None` if a
 /// committed part is not write-watched (or the range is one committed
-/// allocation, already refused).
-fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
+/// allocation, already refused); then `lost` has the pages found written
+/// before it, which the kernel no longer reports.
+fn by_allocation(
+    start: usize,
+    end: usize,
+    found: &mut Vec<usize>,
+    lost: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -152,6 +167,9 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
                 )
             } != 0;
             if failed {
+                // What the allocations before this one reported is cleared
+                // in the kernel now: it must still reach the journal.
+                lost.extend(pages);
                 return None;
             }
             pages.extend(found[..count].iter().map(|&a| a / PAGE));
@@ -458,6 +476,44 @@ mod tests {
         }
         let (now, found) = writes(p, p + 2 * PAGE, false).expect("watched");
         assert_eq!(found, [(p / PAGE, now)]);
+        // Not freed: the journal keeps these pages, and a later test given
+        // the same addresses would find them written.
+    }
+
+    /// A range over a watched allocation and one that is not: the question
+    /// is refused, and what was written in the watched one, which asking it
+    /// cleared in the kernel, is still reported to the next asker.
+    #[test]
+    fn writes_found_before_a_refusal_are_kept() {
+        let (a, b) = loop {
+            // SAFETY: a probe reservation, released at once to find room for two.
+            let span = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!span.is_null());
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(span, 0, MEM_RELEASE) };
+            let at = |p: usize, watch: u32| {
+                // SAFETY: a fixed address in the room just released.
+                let got = unsafe {
+                    VirtualAlloc(p as *const _, 2 * PAGE, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE)
+                };
+                got as usize
+            };
+            let a = at(span as usize, MEM_WRITE_WATCH);
+            let b = at(span as usize + 2 * PAGE, 0);
+            if a != 0 && b != 0 {
+                break (a, b);
+            }
+            for p in [a, b].into_iter().filter(|&p| p != 0) {
+                // SAFETY: ours.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            }
+        };
+        let _ = writes(a, a + 2 * PAGE, false);
+        // SAFETY: committed pages of ours.
+        unsafe { ((a + 8) as *mut u8).write(1) };
+        assert!(writes(a, b + 2 * PAGE, false).is_none());
+        let (_, found) = writes(a, a + 2 * PAGE, false).expect("watched");
+        assert_eq!(found.iter().map(|&(p, _)| p).collect::<Vec<_>>(), [a / PAGE]);
         // Not freed: the journal keeps these pages, and a later test given
         // the same addresses would find them written.
     }
