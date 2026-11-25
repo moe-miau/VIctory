@@ -794,8 +794,8 @@ pub(super) fn compute_uniformity(
 }
 
 /// Group-uniform checkpoints that order the LDS accesses of a split console
-/// wave. A divergent region cannot contain two accesses without such a
-/// checkpoint: placing a group barrier inside it could deadlock.
+/// wave. A divergent region cannot contain a read and a write without such
+/// a checkpoint: placing a group barrier inside it could deadlock.
 #[derive(Default)]
 pub(super) struct LdsFences {
     pub(super) enter: HashSet<usize>,
@@ -825,9 +825,13 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
         offset: inst.machine.offset,
         what: "LDS accesses without a uniform LDS fence in split wave64",
     };
-    // The two host halves can take different arms at the same time. Multiple pure
-    // reads cannot race with each other, whereas any write/atomic conflicts with
-    // another read or write anywhere in the same unfenced divergent region.
+    // The two host halves can take different arms at the same time. A read
+    // conflicts with a write anywhere in the same unfenced divergent region;
+    // reads with reads and writes with writes do not (the title's per-lane
+    // records, e.g. the BVH builder's, write several slots in a row).
+    // shortcut: two halves writing the same address in successive writes may
+    // keep the earlier one, not the console's later one; refuse write after
+    // write too if a title relies on that.
     for &root in &order {
         if !uniform[root] && root != order[0] {
             continue;
@@ -847,7 +851,7 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
             seen[b] = true;
             for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
                 if is_write(inst) {
-                    if saw_write || saw_read {
+                    if saw_read {
                         return Err(fail(inst));
                     }
                     saw_write = true;
@@ -903,7 +907,7 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
             let mut prev_write = in_write;
             for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
                 if is_write(inst) {
-                    if prev_write || prev_read {
+                    if prev_read {
                         return Err(fail(inst));
                     }
                     prev_write = true;

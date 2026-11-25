@@ -696,6 +696,43 @@ fn lds_region_program(divergent_write: bool, join_between: bool, delay: bool) ->
     make_cs_program(&code, [64, 1, 1], 512, false)
 }
 
+/// Odd lanes of both halves write two slots of their own (byte `8 * tid`) in
+/// one divergent region, as the BVH builder's per-lane records do; after the
+/// join each lane stores the sum of its slots (`2 * tid + 16` odd, 0 even).
+fn lds_divergent_writes_program() -> NativeProgram {
+    let mut code = vec![
+        v_mov_b32(3, inline_u(0)),
+        v_lshlrev_b32(2, inline_u(3), 0),
+        v_add_nc_u32(4, inline_u(7), 0),
+        v_add_nc_u32(6, inline_u(9), 0),
+    ];
+    code.extend(ds_op(0x0D, 0, 0, 2, 3, 0)); // ds_write_b32 v2, v3
+    code.extend(ds_op(0x0D, 4, 0, 2, 3, 0)); // ds_write_b32 v2, v3 offset:4
+    code.push(v_and_b32(5, inline_u(1), 0));
+    code.push(v_cmp_lt_u32(inline_u(0), 5)); // odd lanes
+    code.push(s_and_saveexec_b64(6, VCC));
+    let at = code.len();
+    code.push(0);
+    code.extend(ds_op(0x0D, 0, 0, 2, 4, 0)); // ds_write_b32 v2, v4
+    code.extend(ds_op(0x0D, 4, 0, 2, 6, 0)); // ds_write_b32 v2, v6 offset:4
+    code[at] = s_cbranch_execz((code.len() - (at + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    code.extend(ds_op(0x36, 0, 0, 2, 0, 3)); // ds_read_b32 v3, v2
+    code.extend(ds_op(0x36, 4, 0, 2, 0, 5)); // ds_read_b32 v5, v2 offset:4
+    code.push(v_add_nc_u32(3, vgpr(5), 3));
+    emit_uav_store(&mut code, 3, 0);
+    code.push(S_ENDPGM);
+    make_cs_program(&code, [64, 1, 1], 512, false)
+}
+
+#[test]
+fn divergent_lds_writes_without_reads_succeed() {
+    let prog = lds_divergent_writes_program();
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        assert!(emit_cs(&prog, mode).is_ok(), "{mode:?} should succeed");
+    }
+}
+
 #[test]
 fn divergent_lds_without_a_uniform_fence_is_rejected() {
     let prog = lds_region_program(true, false, false);
@@ -1251,6 +1288,15 @@ mod gpu {
             for _ in 0..5 {
                 run_on_hosts(name, &prog, [1, 1, 1], 64, expected, true);
             }
+        }
+    }
+
+    #[test]
+    fn gpu_divergent_lds_writes_without_reads() {
+        let expected: Vec<u32> = (0..64).map(|t| if t % 2 == 1 { 2 * t + 16 } else { 0 }).collect();
+        let prog = lds_divergent_writes_program();
+        for _ in 0..5 {
+            run_on_hosts("divergent writes, read after the join", &prog, [1, 1, 1], 64, &expected, true);
         }
     }
 
